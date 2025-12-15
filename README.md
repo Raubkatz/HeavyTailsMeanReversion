@@ -1,6 +1,6 @@
 # Mean Reversion and Heavy Tails — Experimental Code Repository
 
-Author: Sebastian Raubitzek
+Author: Dr. Sebastian Raubitzek
 
 ## Overview
 
