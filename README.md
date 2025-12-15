@@ -57,11 +57,16 @@ Trained models are then applied unchanged to real-world time series in A, B, and
 ├── A_03_alpha_theta_counts_finance.py
 ├── A_04_finance_alpha_binary_counts_stock.py
 │
-├── B_*
-│ └── (solar / sunspot evaluation scripts, same structure as A_)
+├── B_01_download_spaceweather.py
+├── B_02_evaluation_spaceweather.py
+├── B_03_spaceweather_alpha_theta_counts.py
+├── B_04_spaceweather_alpha_binary_counts.py
 │
-├── C_*
-│ └── (environmental / climate evaluation scripts, same structure as A_)
+├── C_01_download_NASC_POWER_aut.py
+├── C_02_plot_aut_NASC_locations.py
+├── C_03_evaluate_NASC_POWER.py
+├── C_04_alpha_theta_counts_NASC_POWER.py
+├── C_05_alpha_theta_counts_binary_NASC_POWER.p
 │
 ├── data_/ # generated datasets
 ├── ML_data/ # windowed ML datasets
@@ -175,37 +180,129 @@ python A_04_finance_alpha_binary_counts_stock.py
 
 ---
 
-## Use Case B: Solar Activity Time Series (Prefix `B_`)
+## Use Case B: Space Weather / Solar-Terrestrial Indices (Prefix `B_`)
 
 ### Purpose
 
-Analyze daily sunspot numbers using the same trained models to detect changes in tail behavior and mean reversion across solar cycles.
+Download daily space weather series (1980–2024) and apply the trained α/θ models to identify changes in local tail behavior and mean-reversion regimes over time. :contentReference[oaicite:11]{index=11}
 
-### Structure
+### B_01 — Download daily space weather data
 
-- Same pipeline as A_
-- Different input data source (sunspot time series)
-- Identical windowing, prediction, and aggregation logic
-- Outputs domain-specific statistics and plots
+python B_01_download_spaceweather.py
+
+Downloads and builds daily time series for:
+
+- SILSO daily sunspot number
+- NOAA SWPC F10.7 cm flux
+- NOAA SWPC Kp (daily mean) and Ap
+
+Outputs (fixed layout):
+
+- `./data_spaceweather_daily_1980_2024/Global/`
+  - `sunspot_daily_SN_d_tot_V2.0_1980_2024.csv`
+  - `f107_daily_swpc_1980_2024.csv`
+  - `kp_ap_daily_swpc_1980_2024.csv`
+  - `plots/` and a per-folder README :contentReference[oaicite:12]{index=12}
+
+### B_02 — Evaluate space weather series with α/θ models
+
+python B_02_evaluation_spaceweather.py
+
+- Materializes single-column series into `Date, close` format under:
+  - `./data_spaceweather_daily_series_global/`
+- Runs rolling-window inference (default: `WINDOW_SIZE=50`, `STEP_SIZE=1`)
+- Writes per-variable prediction CSVs, plots, and an analysis text file under:
+  - `./data_spaceweather_evaluation_daily_global/Global/<VAR>/` :contentReference[oaicite:13]{index=13}
+
+### B_03 — Multiclass α/θ category counts (space weather)
+
+python B_03_spaceweather_alpha_theta_counts.py
+
+- Reads prediction CSVs under `./data_spaceweather_evaluation_daily_global`
+- Aggregates α and θ category counts:
+  - per file, per period, per year, and relative shares
+- Writes outputs to:
+  - `./data_spaceweather_statistics_global/`
+  - plus yearly log-scale plots under `stats_plots/` :contentReference[oaicite:14]{index=14}
+
+### B_04 — Binary regime counts (space weather)
+
+python B_04_spaceweather_alpha_binary_counts.py
+
+- Binary mappings:
+  - α: `gaussian` if α == 2.0, else `levy`
+  - θ: `no_mean_rev` if θ == 1e−6, else `mean_rev`
+- Writes binary count summaries and plots to:
+  - `./data_spaceweather_statistics_global/` :contentReference[oaicite:15]{index=15}
 
 ---
 
-## Use Case C: Environmental and Climate Time Series (Prefix `C_`)
+## Use Case C: NASA POWER Daily Climate Data for Austria (Prefix `C_`)
 
 ### Purpose
 
-Apply the trained classifiers to climate variables (e.g. irradiance, temperature, cloud cover) from NASA POWER data for Austria.
+Download daily NASA POWER data for multiple Austrian locations and apply the trained α/θ models to quantify local regime structure across locations, variables, and time periods. :contentReference[oaicite:16]{index=16}
 
-### Structure
+### C_01 — Download NASA POWER daily time series (Austria locations)
 
-- Same pipeline as A_ and B_
-- Climate-specific preprocessing
-- Rolling-window regime detection
-- Regional and temporal aggregation of α/θ categories
+python C_01_download_NASC_POWER_aut.py
+
+- Downloads daily NASA POWER (AG community) for many predefined Austrian locations
+- Writes one folder per location under:
+  - `./data_at_power_daily_1981_2025/<Location>/`
+- Produces:
+  - per-location CSV
+  - per-variable plots
+  - an `INDEX.csv` at the root with location metadata :contentReference[oaicite:17]{index=17}
+
+### C_02 — Plot Austria location map
+
+python C_02_plot_aut_NASC_locations.py
+
+- Reads `INDEX.csv` from `./data_at_power_daily_1981_2025/`
+- Plots Austrian border (GeoPandas optional) and all NASA POWER points
+- Writes:
+  - `austria_power_points_map.png`
+  - `austria_power_points_map.eps` :contentReference[oaicite:18]{index=18}
+
+### C_03 — Evaluate NASA POWER variables with α/θ models
+
+python C_03_evaluate_NASC_POWER.py
+
+- Reads per-location NASA POWER CSVs from `./data_at_power_daily_1981_2025/`
+- For each location and each configured variable, materializes `Date, close`
+- Runs rolling-window inference (default: `WINDOW_SIZE=50`, `STEP_SIZE=1`)
+- Writes outputs under:
+  - `./data_power_evaluation_daily_aut/<Location>/<VAR>/`
+    - `pred_<Location>_<VAR>_<sy>_<ey>_w..._s....csv`
+    - α/θ plots and an analysis `.txt` :contentReference[oaicite:19]{index=19}
+
+### C_04 — Multiclass α/θ category counts (NASA POWER)
+
+python C_04_alpha_theta_counts_NASC_POWER.py
+
+- Aggregates α and θ category counts across:
+  - locations, variables, periods, years
+- Writes per-file and aggregated CSV summaries and yearly log-scale plots to:
+  - `./data_power_statistics_aut/` :contentReference[oaicite:20]{index=20}
+
+### C_05 — Binary regime counts with background variable curve (NASA POWER)
+
+python C_05_alpha_theta_counts_binary_NASC_POWER.py
+
+- Computes yearly binary regime counts for each variable:
+  - α: `gaussian` vs `levy`
+  - θ: `no_mean_rev` vs `mean_rev`
+- Adds an optional daily background curve per variable:
+  - daily median across all files/locations for that variable, clipped to the global plotting window
+- Writes outputs to:
+  - `./data_power_statistics_aut/` :contentReference[oaicite:21]{index=21}
 
 ---
 
 ## Requirements
+
+Core dependencies used across scripts:
 
 numpy
 pandas
@@ -216,14 +313,16 @@ scikit-optimize
 matplotlib
 seaborn
 tqdm
+requests
 yfinance
 
+yaml
+Code kopieren
 
 ---
 
 ## Notes
 
-- All real-world evaluations reuse the same trained models.
-- No retraining is performed for A, B, or C.
-- The framework is diagnostic, not predictive.
-- Outputs are intended for regime characterization and comparative analysis.
+- Use cases A, B, and C expect trained α/θ models to exist (produced by `03_train_ML_ts.py`).
+- Rolling-window evaluation assumes a single-column numeric series in `close` after materialization.
+- Output folders are fixed in the scripts; change paths there if you need a different layout.
