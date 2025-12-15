@@ -48,32 +48,56 @@ Trained models are then applied unchanged to real-world time series in A, B, and
 ## Repository Structure
 
 ├── 01_generate_dimless_levy_OU_tsdata.py
-├── 02_build_ML_ts_dataset.py
-├── 03_train_ML_ts.py
-├── 04_evaluation_cat_and_bin.py
-│
-├── A_01_donwload_new_financial_time_series.py
-├── A_02_evaluate_financial_data.py
-├── A_03_alpha_theta_counts_finance.py
-├── A_04_finance_alpha_binary_counts_stock.py
-│
-├── B_01_download_spaceweather.py
-├── B_02_evaluation_spaceweather.py
-├── B_03_spaceweather_alpha_theta_counts.py
-├── B_04_spaceweather_alpha_binary_counts.py
-│
-├── C_01_download_NASC_POWER_aut.py
-├── C_02_plot_aut_NASC_locations.py
-├── C_03_evaluate_NASC_POWER.py
-├── C_04_alpha_theta_counts_NASC_POWER.py
-├── C_05_alpha_theta_counts_binary_NASC_POWER.p
-│
-├── data_/ # generated datasets
-├── ML_data/ # windowed ML datasets
-├── noncomplex_results/ # trained models and reports
-├── evaluation_/ # domain-specific evaluation outputs
-└── README.md
 
+├── 02_build_ML_ts_dataset.py
+
+├── 03_train_ML_ts.py
+
+├── 04_evaluation_cat_and_bin.py
+
+│
+
+├── A_01_donwload_new_financial_time_series.py
+
+├── A_02_evaluate_financial_data.py
+
+├── A_03_alpha_theta_counts_finance.py
+
+├── A_04_finance_alpha_binary_counts_stock.py
+
+│
+
+├── B_01_download_spaceweather.py
+
+├── B_02_evaluation_spaceweather.py
+
+├── B_03_spaceweather_alpha_theta_counts.py
+
+├── B_04_spaceweather_alpha_binary_counts.py
+
+│
+
+├── C_01_download_NASC_POWER_aut.py
+
+├── C_02_plot_aut_NASC_locations.py
+
+├── C_03_evaluate_NASC_POWER.py
+
+├── C_04_alpha_theta_counts_NASC_POWER.py
+
+├── C_05_alpha_theta_counts_binary_NASC_POWER.py
+
+│
+
+├── data_/ # generated datasets
+
+├── ML_data/ # windowed ML datasets
+
+├── noncomplex_results/ # trained models and reports
+
+├── evaluation_/ # domain-specific evaluation outputs
+
+└── README.md
 
 ---
 
