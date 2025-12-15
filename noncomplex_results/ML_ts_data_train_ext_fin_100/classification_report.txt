@@ -1,0 +1,22 @@
+Classification Report for THETA (Chosen Final Model, non-complex):
+
+Chosen Model Type: Baseline (Default) Model
+
+              precision    recall  f1-score   support
+
+       1e-06       0.76      0.75      0.76     78000
+         2.0       0.69      0.62      0.66     78000
+         4.0       0.66      0.63      0.65     78000
+         8.0       0.68      0.72      0.70     78000
+        16.0       0.76      0.80      0.78     78000
+        32.0       0.90      0.92      0.91     78000
+
+    accuracy                           0.74    468000
+   macro avg       0.74      0.74      0.74    468000
+weighted avg       0.74      0.74      0.74    468000
+
+Accuracy: 0.7435
+Weighted F1 Score: 0.7421
+
+[Baseline => Acc=0.7435, F1=0.7421]
+[Bayes   => Acc=0.7033, F1=0.7007]
