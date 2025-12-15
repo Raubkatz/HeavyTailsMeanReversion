@@ -1,5 +1,7 @@
 # Mean Reversion and Heavy Tails — Experimental Code Repository
 
+Author: Sebastian Raubitzek
+
 ## Overview
 
 This repository implements the full experimental pipeline described in the paper  
