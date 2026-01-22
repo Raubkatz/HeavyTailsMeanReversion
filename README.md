@@ -45,6 +45,11 @@ Trained models are then applied unchanged to real-world time series in A, B, and
    - B_: Solar activity
    - C_: Climate and environmental signals
 
+5. **Correlation analysis vs. classical diagnostics (synthetic, known ground truth)**
+   - Evaluates a library of classical estimators/complexity metrics on the same OU windows
+   - Aggregates metric outputs by ground-truth class and compares them to α/θ via correlation and linear recalibration
+   - Compares metric-derived estimates to CatBoost predictions for context
+
 ---
 
 ## Repository Structure
@@ -56,6 +61,12 @@ Trained models are then applied unchanged to real-world time series in A, B, and
 ├── 03_train_ML_ts.py
 
 ├── 04_evaluation_cat_and_bin.py
+
+├── 05_final_correlation_analysis_alpha.py
+
+├── 06_final_correlation_analysis_theta.py
+
+├── func_complexity_metrics_2026.py
 
 │
 
@@ -95,9 +106,11 @@ Trained models are then applied unchanged to real-world time series in A, B, and
 
 ├── ML_data/ # windowed ML datasets
 
-├── noncomplex_results/ # trained models and reports
+├── noncomplex_results/ # trained models and reports (per window size)
 
 ├── evaluation_/ # domain-specific evaluation outputs
+
+├── ML_MODELS_HURST/ # optional: pre-trained CatBoost Hurst models used by func_complexity_metrics_2026.py (if present)
 
 └── README.md
 
@@ -135,8 +148,14 @@ python 03_train_ML_ts.py
 - Separate models for:
   - α (tail index classification)
   - θ (mean reversion classification)
-- Supports baseline and Bayesian-optimized training
 - Saves models, confusion matrices, and reports
+
+**Model output layout (used by downstream scripts):**
+- Models and reports are stored per window size under:
+  - `./noncomplex_results/ML_ts_data_train_ext_fin_<W>/`
+- Typical model filenames:
+  - `catboost_alpha_ts_ext_fin_<W>.cbm`
+  - `catboost_theta_ts_ext_fin_<W>.cbm`
 
 ---
 
@@ -149,6 +168,51 @@ python 04_evaluation_cat_and_bin.py
   - Multiclass confusion matrices
   - Binary evaluations (Gaussian vs. Lévy, mean reversion vs. none)
 - Outputs both absolute and relative confusion matrices
+
+---
+
+### 5. Complexity / classical estimator correlation analysis (synthetic ground truth)
+
+python 05_final_correlation_analysis_alpha.py  
+python 06_final_correlation_analysis_theta.py
+
+Purpose:
+- Quantify how well classical time-series diagnostics and estimators track the known ground-truth parameters (α, θ) on synthetic OU windows.
+- Provide a direct reference for interpreting ML outputs by comparing classical metrics to CatBoost predictions on the same windows.
+
+Key inputs:
+- Windowed datasets from `./ML_data/`:
+  - scaled windows: `ML_ts_data_analysis_ext_fin_<W>.csv`
+  - aligned unscaled windows: `ML_ts_data_analysis_ext_fin_<W>_unscaled.csv`
+- Trained CatBoost models loaded from `./noncomplex_results/`:
+  - α script loads: `./noncomplex_results/ML_ts_data_train_ext_fin_<W>/catboost_alpha_ts_ext_fin_<W>.cbm`
+  - θ script loads: `./noncomplex_results/ML_ts_data_train_ext_fin_<W>/catboost_theta_ts_ext_fin_<W>.cbm`
+
+Metrics source:
+- All classical metrics are loaded via the shared registry in:
+  - `func_complexity_metrics_2026.py`
+- This file provides a uniform interface (`get_metric_registry()`, `compute_metric(...)`) and includes robust fallbacks (returns `np.nan` if a dependency is missing).
+- It also includes an optional CatBoost-based Hurst estimator, which loads pre-trained models from:
+  - `ML_MODELS_HURST/` (only if this folder exists and the models are available).
+
+Evaluation logic (both scripts):
+- For each window size W (handled separately):
+  - Evaluate each metric on three representations:
+    (i) scaled windows, (ii) unscaled windows, (iii) returns from unscaled windows.
+  - Aggregate metric outputs by ground-truth class (mean ± std across windows).
+  - Compare to ground truth using Spearman, Pearson, and linear recalibration statistics.
+  - Compare metric-derived outputs to CatBoost predictions for context.
+
+Outputs:
+- α correlation outputs:
+  - `./alpha_correlation_analysis_final/W_<W>/...`
+- θ correlation outputs:
+  - `./theta_correlation_analysis_final/W_<W>/...`
+- Each contains:
+  - per-sample CSV exports,
+  - mean / mean±std plots by ground-truth class,
+  - metric summaries and correlation summaries,
+  - metric error logs (per-window and global).
 
 ---
 
@@ -210,7 +274,7 @@ python A_04_finance_alpha_binary_counts_stock.py
 
 ### Purpose
 
-Download daily space weather series (1980–2024) and apply the trained α/θ models to identify changes in local tail behavior and mean-reversion regimes over time. :contentReference[oaicite:11]{index=11}
+Download daily space weather series (1980–2024) and apply the trained α/θ models to identify changes in local tail behavior and mean-reversion regimes over time.
 
 ### B_01 — Download daily space weather data
 
@@ -228,7 +292,7 @@ Outputs (fixed layout):
   - `sunspot_daily_SN_d_tot_V2.0_1980_2024.csv`
   - `f107_daily_swpc_1980_2024.csv`
   - `kp_ap_daily_swpc_1980_2024.csv`
-  - `plots/` and a per-folder README :contentReference[oaicite:12]{index=12}
+  - `plots/` and a per-folder README
 
 ### B_02 — Evaluate space weather series with α/θ models
 
@@ -238,7 +302,7 @@ python B_02_evaluation_spaceweather.py
   - `./data_spaceweather_daily_series_global/`
 - Runs rolling-window inference (default: `WINDOW_SIZE=50`, `STEP_SIZE=1`)
 - Writes per-variable prediction CSVs, plots, and an analysis text file under:
-  - `./data_spaceweather_evaluation_daily_global/Global/<VAR>/` :contentReference[oaicite:13]{index=13}
+  - `./data_spaceweather_evaluation_daily_global/Global/<VAR>/`
 
 ### B_03 — Multiclass α/θ category counts (space weather)
 
@@ -249,7 +313,7 @@ python B_03_spaceweather_alpha_theta_counts.py
   - per file, per period, per year, and relative shares
 - Writes outputs to:
   - `./data_spaceweather_statistics_global/`
-  - plus yearly log-scale plots under `stats_plots/` :contentReference[oaicite:14]{index=14}
+  - plus yearly log-scale plots under `stats_plots/`
 
 ### B_04 — Binary regime counts (space weather)
 
@@ -259,7 +323,7 @@ python B_04_spaceweather_alpha_binary_counts.py
   - α: `gaussian` if α == 2.0, else `levy`
   - θ: `no_mean_rev` if θ == 1e−6, else `mean_rev`
 - Writes binary count summaries and plots to:
-  - `./data_spaceweather_statistics_global/` :contentReference[oaicite:15]{index=15}
+  - `./data_spaceweather_statistics_global/`
 
 ---
 
@@ -267,7 +331,7 @@ python B_04_spaceweather_alpha_binary_counts.py
 
 ### Purpose
 
-Download daily NASA POWER data for multiple Austrian locations and apply the trained α/θ models to quantify local regime structure across locations, variables, and time periods. :contentReference[oaicite:16]{index=16}
+Download daily NASA POWER data for multiple Austrian locations and apply the trained α/θ models to quantify local regime structure across locations, variables, and time periods.
 
 ### C_01 — Download NASA POWER daily time series (Austria locations)
 
@@ -279,7 +343,7 @@ python C_01_download_NASC_POWER_aut.py
 - Produces:
   - per-location CSV
   - per-variable plots
-  - an `INDEX.csv` at the root with location metadata :contentReference[oaicite:17]{index=17}
+  - an `INDEX.csv` at the root with location metadata
 
 ### C_02 — Plot Austria location map
 
@@ -289,7 +353,7 @@ python C_02_plot_aut_NASC_locations.py
 - Plots Austrian border (GeoPandas optional) and all NASA POWER points
 - Writes:
   - `austria_power_points_map.png`
-  - `austria_power_points_map.eps` :contentReference[oaicite:18]{index=18}
+  - `austria_power_points_map.eps`
 
 ### C_03 — Evaluate NASA POWER variables with α/θ models
 
@@ -301,7 +365,7 @@ python C_03_evaluate_NASC_POWER.py
 - Writes outputs under:
   - `./data_power_evaluation_daily_aut/<Location>/<VAR>/`
     - `pred_<Location>_<VAR>_<sy>_<ey>_w..._s....csv`
-    - α/θ plots and an analysis `.txt` :contentReference[oaicite:19]{index=19}
+    - α/θ plots and an analysis `.txt`
 
 ### C_04 — Multiclass α/θ category counts (NASA POWER)
 
@@ -310,7 +374,7 @@ python C_04_alpha_theta_counts_NASC_POWER.py
 - Aggregates α and θ category counts across:
   - locations, variables, periods, years
 - Writes per-file and aggregated CSV summaries and yearly log-scale plots to:
-  - `./data_power_statistics_aut/` :contentReference[oaicite:20]{index=20}
+  - `./data_power_statistics_aut/`
 
 ### C_05 — Binary regime counts with background variable curve (NASA POWER)
 
@@ -322,7 +386,7 @@ python C_05_alpha_theta_counts_binary_NASC_POWER.py
 - Adds an optional daily background curve per variable:
   - daily median across all files/locations for that variable, clipped to the global plotting window
 - Writes outputs to:
-  - `./data_power_statistics_aut/` :contentReference[oaicite:21]{index=21}
+  - `./data_power_statistics_aut/`
 
 ---
 
@@ -335,15 +399,24 @@ pandas
 scipy
 scikit-learn
 catboost
-scikit-optimize
 matplotlib
 seaborn
 tqdm
 requests
 yfinance
-
 yaml
-Code kopieren
+
+Optional dependencies (used by some metrics in func_complexity_metrics_2026.py, with NaN fallback if missing):
+nolds
+antropy (or entropy)
+hurst
+statsmodels
+
+Local project file required for correlation analysis:
+./func_complexity_metrics_2026.py
+
+Optional model folder (only needed if you want the CatBoost-based Hurst metric):
+./ML_MODELS_HURST/
 
 ---
 
