@@ -1,20 +1,94 @@
+"""
+Context and purpose (project-level docstring)
+---------------------------------------------
+
+This script trains and evaluates the project’s baseline CatBoost classifiers for
+window-based regime identification of Ornstein--Uhlenbeck (OU) processes with
+\alpha-stable increments.
+
+Project context
+---------------
+In this project, each sample is a fixed-length sliding window extracted from a
+simulated (and in later stages also empirical) univariate time series. Windows
+are preprocessed by min--max scaling to the unit interval and stored in CSV
+files with a list-valued column 'scaled_time_series'. Each window inherits the
+ground-truth parameters of the generating OU process:
+  - \theta: mean-reversion rate (multiclass classification),
+  - \alpha: stability index / tail heaviness (multiclass classification),
+and optionally:
+  - copy: replication identifier (e.g., different noise seeds).
+
+This training script consumes those window-level CSVs and produces:
+  - a default CatBoostClassifier for \alpha and for \theta per window size,
+  - standard evaluation artifacts (classification report, confusion matrices),
+  - a "true-training" subset CSV consisting only of windows that the trained
+    model predicts correctly on the full training CSV,
+  - an additional selection step that repeatedly trains on balanced subsets of
+    that true-training data (N_ITER iterations) and keeps the best model.
+
+What the script does
+--------------------
+For each chosen window-size dataset (e.g., 50/100/250/365):
+  1) Load the scaled window CSV.
+  2) Build X from 'scaled_time_series' and y from the target column.
+  3) Train a default CatBoost multiclass classifier on a stratified train/test split.
+  4) Save the model and evaluation artifacts to a dedicated results folder.
+  5) Evaluate the model on the full training CSV.
+  6) Build a "true-training" CSV (rows predicted correctly by the model).
+  7) Run repeated training on balanced subsets from that true-training CSV and
+     save the best-performing model among iterations.
+
+Notes on design choices
+-----------------------
+- Training uses CatBoost GPU mode (task_type="GPU", devices="0").
+- Labels are handled as strings to avoid type/format mismatches.
+- The "true-training" + balanced-subset iteration is intended as an auxiliary
+  robustness check and a way to study model stability under controlled sampling.
+
+Functions and parameters (end-user oriented)
+--------------------------------------------
+- train_model_for_alpha_noncomplex(...), train_model_for_theta_noncomplex(...)
+  Main entry points per target (\alpha or \theta). Key parameters:
+    - train_csv: filename of the window-level CSV (relative to data_folder).
+    - test_size: fraction reserved for the internal test split.
+    - random_state: seed for reproducibility.
+    - model_*_path: filename for the saved CatBoost model.
+    - show_confusion_matrix: whether to display plots interactively.
+    - data_folder: folder containing the training CSV files.
+    - true_fraction: fraction of the minority-class count used when constructing
+      balanced subsets from the true-training CSV.
+
+- iterate_true_training_models(...)
+  Repeats training on balanced subsets from the true-training CSV and selects
+  the best model by accuracy (tie-breaker: weighted F1).
+
+All other helper functions are internal utilities for loading/parsing, label
+handling, evaluation, and file output.
+"""
+
 import os
+import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+from typing import Tuple, Dict
+
 from catboost import CatBoostClassifier
-from skopt import BayesSearchCV
-from skopt.space import Integer
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, f1_score
 
 ##############################################################################
-# 1) Data-Loading Helpers for Non-Complex / Scaled Time Series
+# 0) Global
 ##############################################################################
 
-N_ITER = 50
+# Now used as the number of random draws/iterations on true-training data
+N_ITER = 10
+
+##############################################################################
+# 1) Data-Loading Helpers for Non-Complex / Scaled Time Series
+##############################################################################
 
 def load_noncomplex_data(csv_path):
     """
@@ -28,54 +102,256 @@ def load_noncomplex_data(csv_path):
     print(f"[INFO] Data shape: {df.shape}")
     return df
 
-def prepare_features_for_alpha_noncomplex(df):
-    """
-    For ALPHA classification using the scaled time-series approach:
-      - 'alpha' => label
-      - 'scaled_time_series' => a list of floats (length = window_size).
-
-    X.shape = (n_samples, window_size)
-    y.shape = (n_samples,) with string labels for alpha.
-    """
-    print("[INFO] Preparing features for Alpha prediction (scaled time-series).")
-
-    df["alpha_str"] = df["alpha"].astype(str)
-
-    # If "scaled_time_series" is stored as a string, parse it
-    if isinstance(df["scaled_time_series"].iloc[0], str):
+def _ensure_timeseries_parsed(df: pd.DataFrame) -> pd.DataFrame:
+    if len(df) > 0 and isinstance(df["scaled_time_series"].iloc[0], str):
         import ast
+        df = df.copy()
         df["scaled_time_series"] = df["scaled_time_series"].apply(ast.literal_eval)
+    return df
 
-    X_list = df["scaled_time_series"].tolist()
-    X = np.array(X_list, dtype=float)  # (n_samples, window_size)
+def prepare_features_for_alpha_noncomplex(df):
+    print("[INFO] Preparing features for Alpha prediction (scaled time-series).")
+    df = _ensure_timeseries_parsed(df).copy()
+    df["alpha_str"] = df["alpha"].astype(str)
+    X = np.array(df["scaled_time_series"].tolist(), dtype=float)
     y = df["alpha_str"].values
-
     print(f"[INFO] Feature matrix shape (for Alpha): {X.shape}, label array length: {len(y)}")
     return X, y
 
 def prepare_features_for_theta_noncomplex(df):
-    """
-    For THETA classification using the scaled time-series approach:
-      - 'theta' => label
-      - 'scaled_time_series' => a list of floats.
-
-    X.shape = (n_samples, window_size)
-    y.shape = (n_samples,) with string labels for theta.
-    """
     print("[INFO] Preparing features for Theta prediction (scaled time-series).")
-
+    df = _ensure_timeseries_parsed(df).copy()
     df["theta_str"] = df["theta"].astype(str)
-
-    if isinstance(df["scaled_time_series"].iloc[0], str):
-        import ast
-        df["scaled_time_series"] = df["scaled_time_series"].apply(ast.literal_eval)
-
-    X_list = df["scaled_time_series"].tolist()
-    X = np.array(X_list, dtype=float)
+    X = np.array(df["scaled_time_series"].tolist(), dtype=float)
     y = df["theta_str"].values
-
     print(f"[INFO] Feature matrix shape (for Theta): {X.shape}, label array length: {len(y)}")
     return X, y
+
+##############################################################################
+# 1.25) Label resolver (handles *_str vs base labels)
+##############################################################################
+
+def _get_label_series(df: pd.DataFrame, label_col: str) -> pd.Series:
+    """
+    Returns a string-typed Series for the requested label.
+    Accepts either 'alpha' or 'alpha_str' (same for 'theta').
+    Falls back gracefully if only the counterpart exists.
+    """
+    if label_col in df.columns:
+        return df[label_col].astype(str)
+    # If 'alpha_str' requested but only 'alpha' exists
+    if label_col.endswith("_str"):
+        base = label_col[:-4]
+        if base in df.columns:
+            return df[base].astype(str)
+    # If 'alpha' requested but only 'alpha_str' exists
+    else:
+        str_col = f"{label_col}_str"
+        if str_col in df.columns:
+            return df[str_col].astype(str)
+    raise KeyError(f"Label column '{label_col}' not found (also checked counterpart).")
+
+##############################################################################
+# 1.5) Helpers for full-train evaluation, true-train extraction, and iteration
+##############################################################################
+
+def evaluate_on_full_training(final_model: CatBoostClassifier,
+                              df: pd.DataFrame,
+                              label_col: str) -> Tuple[np.ndarray, str, float, float]:
+    """
+    Predicts the entire provided training dataframe and prints/returns metrics.
+    """
+    print(f"[INFO] Evaluating chosen model on the entire training dataframe (label='{label_col}').")
+    df = _ensure_timeseries_parsed(df)
+    X = np.array(df["scaled_time_series"].tolist(), dtype=float)
+    y_true = _get_label_series(df, label_col).values
+
+    y_pred = final_model.predict(X)
+    acc = accuracy_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred, average="weighted")
+    cm = confusion_matrix(y_true, y_pred, labels=final_model.classes_)
+    report = classification_report(y_true, y_pred, labels=final_model.classes_)
+
+    print("\n[FINAL on FULL TRAIN] Classification Report:")
+    print(report)
+    print("[FINAL on FULL TRAIN] Confusion Matrix:")
+    print(cm)
+    print(f"[FINAL on FULL TRAIN] Accuracy={acc:.4f}, Weighted F1={f1:.4f}\n")
+
+    return cm, report, acc, f1
+
+def save_true_training_subset(df: pd.DataFrame,
+                              final_model: CatBoostClassifier,
+                              label_col: str,
+                              original_csv_path: str) -> str:
+    """
+    Saves the subset of rows that the final_model predicts correctly on the full df.
+    Returns the path of the saved CSV. Saved beside the original training CSV
+    with suffix '_true_train.csv'. Ensures a *_str label exists in the saved file.
+    """
+    print(f"[INFO] Creating and saving 'true training' subset (correct predictions only).")
+    df = _ensure_timeseries_parsed(df).copy()
+    X = np.array(df["scaled_time_series"].tolist(), dtype=float)
+    y_true_series = _get_label_series(df, label_col)
+    y_true = y_true_series.values
+    y_pred = final_model.predict(X)
+
+    correct_mask = (y_pred == y_true)
+    true_df = df.loc[correct_mask].copy()
+    print(f"[INFO] True-training subset size: {true_df.shape[0]} / {df.shape[0]}")
+
+    # Ensure *_str label column is present in the saved CSV
+    if label_col.endswith("_str"):
+        base = label_col[:-4]
+        if label_col not in true_df.columns and base in true_df.columns:
+            true_df[label_col] = true_df[base].astype(str)
+    else:
+        # If caller used base label, also add its *_str for downstream use
+        str_col = f"{label_col}_str"
+        if str_col not in true_df.columns and label_col in true_df.columns:
+            true_df[str_col] = true_df[label_col].astype(str)
+
+    base_dir = os.path.dirname(os.path.abspath(original_csv_path))
+    base_name = os.path.splitext(os.path.basename(original_csv_path))[0]
+    out_path = os.path.join(base_dir, f"{base_name}_true_train.csv")
+    true_df.to_csv(out_path, index=False)
+    print(f"[INFO] Saved true-training CSV to: {out_path}")
+    return out_path
+
+def _balanced_subset_by_fraction(true_df: pd.DataFrame,
+                                 label_col: str,
+                                 fraction: float,
+                                 random_state: int) -> pd.DataFrame:
+    """
+    Builds a balanced subset by downsampling all classes to:
+        per_class_n = floor(fraction * minority_class_count)
+    If per_class_n < 1, returns an empty dataframe.
+    """
+    true_df = true_df.copy()
+
+    # Ensure label_col exists; if not, reconstruct from *_str
+    if label_col not in true_df.columns and f"{label_col}_str" in true_df.columns:
+        true_df[label_col] = true_df[f"{label_col}_str"].astype(str)
+
+    true_df[label_col] = true_df[label_col].astype(str)
+    counts = true_df[label_col].value_counts()
+    if counts.empty:
+        return true_df.iloc[0:0]
+
+    minority_count = counts.min()
+    per_class_n = int(math.floor(fraction * minority_count))
+    if per_class_n < 1:
+        return true_df.iloc[0:0]
+
+    frames = []
+    rng = np.random.default_rng(seed=random_state)
+    for cls, _ in counts.items():
+        cls_df = true_df[true_df[label_col] == cls]
+        n = min(per_class_n, len(cls_df))
+        sampled = cls_df.sample(n=n, random_state=int(rng.integers(0, 1_000_000)), replace=False)
+        frames.append(sampled)
+
+    out = pd.concat(frames, axis=0).sample(frac=1.0, random_state=random_state).reset_index(drop=True)
+    return out
+
+def _fit_default_catboost(X_tr, y_tr, X_te, y_te, random_state: int) -> Dict[str, object]:
+    model = CatBoostClassifier(
+        task_type="GPU",
+        devices="0",
+        verbose=0,
+        random_seed=random_state
+    )
+    model.fit(X_tr, y_tr)
+    y_pred = model.predict(X_te)
+    acc = accuracy_score(y_te, y_pred)
+    f1 = f1_score(y_te, y_pred, average="weighted")
+    return {"model": model, "acc": acc, "f1": f1, "y_pred": y_pred}
+
+def iterate_true_training_models(true_csv_path: str,
+                                 label_col: str,
+                                 results_folder: str,
+                                 random_state: int,
+                                 test_size: float,
+                                 fraction: float = 0.8,
+                                 n_iter: int = N_ITER) -> CatBoostClassifier:
+    """
+    Repeats n_iter times:
+      - Build a balanced subset by downsampling each class to floor(fraction * minority_count).
+      - Train default CatBoost on a train/test split of that subset.
+    Selects the best model by accuracy (tie-breaker F1).
+    Saves a summary CSV and best confusion matrix.
+    Returns the best model (or None if no valid subset could be formed).
+    """
+    print("[INFO] Iterating on balanced subsets from true-training data "
+          f"(fraction={fraction:.2f}, n_iter={n_iter}, no Bayesian optimization).")
+
+    df_true = pd.read_csv(true_csv_path)
+    df_true = _ensure_timeseries_parsed(df_true)
+
+    # Ensure label_col exists; if not, reconstruct from *_str
+    if label_col not in df_true.columns and f"{label_col}_str" in df_true.columns:
+        df_true[label_col] = df_true[f"{label_col}_str"].astype(str)
+
+    df_true[label_col] = df_true[label_col].astype(str)
+
+    iter_folder = os.path.join(results_folder, "true_train_iter")
+    os.makedirs(iter_folder, exist_ok=True)
+
+    summary_rows = []
+    best = {"acc": -1.0, "f1": -1.0, "iter": None, "model": None, "cm": None, "classes_": None, "n_samples": 0}
+
+    for i in range(1, n_iter + 1):
+        balanced = _balanced_subset_by_fraction(df_true, label_col, fraction, random_state + i)
+        if balanced.empty or len(balanced) < 2 or balanced[label_col].nunique() < 2:
+            print(f"[WARN] Iteration {i}: insufficient samples; skipping.")
+            continue
+
+        X = np.array(balanced["scaled_time_series"].tolist(), dtype=float)
+        y = balanced[label_col].values
+
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X, y, test_size=test_size, random_state=random_state + i, stratify=y
+        )
+        out = _fit_default_catboost(X_tr, y_tr, X_te, y_te, random_state + i)
+        acc, f1 = out["acc"], out["f1"]
+        model = out["model"]
+
+        print(f"[ITER TRUE] iter={i:02d} => Acc={acc:.4f}, F1={f1:.4f}, n={len(balanced)}")
+
+        if (acc > best["acc"]) or (math.isclose(acc, best["acc"]) and f1 > best["f1"]):
+            y_pred = out["y_pred"]
+            cm = confusion_matrix(y_te, y_pred, labels=model.classes_)
+            best.update({
+                "acc": acc, "f1": f1, "iter": i,
+                "model": model, "cm": cm, "classes_": model.classes_,
+                "n_samples": len(balanced)
+            })
+
+        summary_rows.append({
+            "iteration": i, "accuracy": acc, "weighted_f1": f1,
+            "n_samples": len(balanced)
+        })
+
+    if not summary_rows:
+        print("[WARN] No valid subset could be formed across iterations. Skipping iteration.")
+        return None
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_path = os.path.join(iter_folder, "iteration_summary.csv")
+    summary_df.to_csv(summary_path, index=False)
+    print(f"[INFO] Iteration summary saved to {summary_path}")
+
+    if best["model"] is not None:
+        plt.figure()
+        sns.heatmap(best["cm"], annot=True, fmt="d", cmap="Blues",
+                    xticklabels=best["classes_"], yticklabels=best["classes_"])
+        plt.title(f"True-Train Iteration Confusion Matrix (best iter={best['iter']}, n={best['n_samples']})")
+        cm_path = os.path.join(iter_folder, "best_confusion_matrix.png")
+        plt.savefig(cm_path)
+        plt.close()
+        print(f"[INFO] Best iteration confusion matrix saved to {cm_path}")
+
+    return best["model"]
 
 ##############################################################################
 # 2) Training for Alpha (Non-Complex)
@@ -87,15 +363,11 @@ def train_model_for_alpha_noncomplex(
         random_state=42,
         model_alpha_path="catboost_alpha_ts.cbm",
         show_confusion_matrix=False,
-        data_folder="./ML_data/"
+        data_folder="./ML_data/",
+        true_fraction=0.8  # single fraction for true-train iterations
 ):
     """
-    1) Loads a 'non-complex' CSV from data_folder/train_csv:
-       - columns: alpha, scaled_time_series (list of floats).
-    2) Splits into train/test.
-    3) Trains a baseline CatBoost model + logs performance => prints confusion matrix & classification report.
-    4) Bayesian optimization => logs performance => prints confusion matrix & classification report.
-    5) Picks the better model, saves final results in 'noncomplex_results/<csv_base>/'.
+    Pipeline for ALPHA with default CatBoost only.
     """
     # 1) Load data
     load_path = os.path.join(data_folder, train_csv)
@@ -103,147 +375,106 @@ def train_model_for_alpha_noncomplex(
     df = load_noncomplex_data(load_path)
     X, y = prepare_features_for_alpha_noncomplex(df)
 
-    # 2) Split
+    # 2) Split + default CatBoost
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
     )
     print(f"[INFO] Alpha train shape: {X_train.shape}, test shape: {X_test.shape}")
 
-    # 3) Baseline Model
-    baseline_model = CatBoostClassifier(
+    model = CatBoostClassifier(
         task_type="GPU",
         devices="0",
         verbose=0,
         random_seed=random_state
     )
-    print("[INFO] Training baseline CatBoost model (Alpha, non-complex)...")
-    baseline_model.fit(X_train, y_train)
+    print("[INFO] Training default CatBoost model (Alpha, non-complex)...")
+    model.fit(X_train, y_train)
 
-    y_pred_base = baseline_model.predict(X_test)
-    base_acc = accuracy_score(y_test, y_pred_base)
-    base_f1 = f1_score(y_test, y_pred_base, average="weighted")
-
-    # --- Additional Printouts (Baseline) ---
-    print("\n[BASELINE Model] Classification Report (Alpha):")
-    print(classification_report(y_test, y_pred_base, labels=baseline_model.classes_))
-    print("[BASELINE Model] Confusion Matrix (Alpha):")
-    print(confusion_matrix(y_test, y_pred_base, labels=baseline_model.classes_))
-
-    print(f"[BASE] Accuracy={base_acc:.4f}, Weighted F1={base_f1:.4f}\n")
-
-    # 4) Bayesian Optimization
-    from skopt import BayesSearchCV
-    from skopt.space import Integer
-
-    bayesian_search_spaces_old = {
-        "depth": Integer(4, 8),
-        "iterations": Integer(500, 3000),
-        "l2_leaf_reg": Integer(1, 10),
-        "border_count": Integer(32, 128)
-    }
-
-    bayesian_search_spaces = {
-        # Centered around CatBoost GPU defaults
-        # depth ~ 6
-        "depth": Integer(5, 7),
-        # iterations ~ 1000
-        "iterations": Integer(900, 1100),
-        # l2_leaf_reg ~ 3
-        "l2_leaf_reg": Integer(2, 5),
-        # GPU default border_count ~ 128 (non-pairwise losses)
-        "border_count": Integer(120, 136)
-    }
-
-    catboost_for_search = CatBoostClassifier(
-        task_type="GPU",
-        devices="0",
-        verbose=0,
-        random_seed=random_state
-    )
-
-    bayes_search = BayesSearchCV(
-        estimator=catboost_for_search,
-        search_spaces=bayesian_search_spaces,
-        n_iter=N_ITER,
-        cv=3,
-        scoring="accuracy",
-        random_state=random_state,
-        verbose=100
-    )
-
-    print("[INFO] Starting Bayesian optimization for CatBoost (Alpha, non-complex)...")
-    bayes_search.fit(X_train, y_train)
-    print("[INFO] Bayesian optimization complete.")
-    print("[INFO] Best parameters for Alpha:", bayes_search.best_params_)
-
-    model_alpha_bayes = bayes_search.best_estimator_
-    y_pred_bayes = model_alpha_bayes.predict(X_test)
-    bayes_acc = accuracy_score(y_test, y_pred_bayes)
-    bayes_f1 = f1_score(y_test, y_pred_bayes, average="weighted")
-
-    # --- Additional Printouts (Bayesian) ---
-    print("\n[BAYESIAN Model] Classification Report (Alpha):")
-    print(classification_report(y_test, y_pred_bayes, labels=model_alpha_bayes.classes_))
-    print("[BAYESIAN Model] Confusion Matrix (Alpha):")
-    print(confusion_matrix(y_test, y_pred_bayes, labels=model_alpha_bayes.classes_))
-
-    print(f"[BAYES] Accuracy={bayes_acc:.4f}, Weighted F1={bayes_f1:.4f}\n")
-
-    # 5) Compare
-    if bayes_f1 > base_f1:
-        final_model = model_alpha_bayes
-        final_model_label = "Bayesian Optimized Model"
-        print("[INFO] => Bayesian model is better for ALPHA (non-complex).")
-    else:
-        final_model = baseline_model
-        final_model_label = "Baseline (Default) Model"
-        print("[INFO] => Baseline model is better (or equal) for ALPHA (non-complex).")
-
-    # Evaluate final chosen model (for saving)
-    y_pred = final_model.predict(X_test)
-    cm = confusion_matrix(y_test, y_pred, labels=final_model.classes_)
-    class_report = classification_report(y_test, y_pred, labels=final_model.classes_)
+    y_pred = model.predict(X_test)
     acc = accuracy_score(y_test, y_pred)
     f1 = f1_score(y_test, y_pred, average="weighted")
 
-    # 6) Save
+    print("\n[DEFAULT Model] Classification Report (Alpha):")
+    print(classification_report(y_test, y_pred, labels=model.classes_))
+    print("[DEFAULT Model] Confusion Matrix (Alpha):")
+    cm = confusion_matrix(y_test, y_pred, labels=model.classes_)
+    print(cm)
+    print(f"[DEFAULT] Accuracy={acc:.4f}, Weighted F1={f1:.4f}\n")
+
+    # 3) Save initial/default model and artifacts
     csv_base = os.path.splitext(os.path.basename(train_csv))[0]
-    folder_path = os.path.join("noncomplex_results", csv_base)
+    folder_path = os.path.join("noncomplex_results_true", csv_base)
     os.makedirs(folder_path, exist_ok=True)
 
     model_file_path = os.path.join(folder_path, model_alpha_path)
-    final_model.save_model(model_file_path)
-    print(f"[INFO] Final alpha model (non-complex) saved to {model_file_path}.")
+    model.save_model(model_file_path)
+    print(f"[INFO] Default alpha model (non-complex) saved to {model_file_path}.")
 
-    # 7) Write classification report to text
     report_path = os.path.join(folder_path, "classification_report.txt")
+    class_report = classification_report(y_test, y_pred, labels=model.classes_)
     with open(report_path, "w") as f:
-        f.write("Classification Report for ALPHA (Chosen Final Model, non-complex):\n\n")
-        f.write(f"Chosen Model Type: {final_model_label}\n\n")
+        f.write("Classification Report for ALPHA (Default CatBoost, non-complex):\n\n")
         f.write(class_report)
         f.write("\n")
         f.write(f"Accuracy: {acc:.4f}\n")
         f.write(f"Weighted F1 Score: {f1:.4f}\n")
-        f.write(f"\n[Baseline => Acc={base_acc:.4f}, F1={base_f1:.4f}]\n")
-        f.write(f"[Bayes   => Acc={bayes_acc:.4f}, F1={bayes_f1:.4f}]\n")
     print(f"[INFO] Classification report saved to {report_path}.")
 
-    # Plot confusion matrix of final chosen model
     plt.figure()
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
-                xticklabels=final_model.classes_,
-                yticklabels=final_model.classes_)
-    plt.title(f"Alpha (non-complex) Confusion Matrix (Final: {final_model_label})")
+                xticklabels=model.classes_, yticklabels=model.classes_)
+    plt.title("Alpha (non-complex) Confusion Matrix (Default)")
     cm_path = os.path.join(folder_path, "confusion_matrix.png")
     plt.savefig(cm_path)
-    print(f"[INFO] Confusion matrix saved to {cm_path}.")
     if show_confusion_matrix:
         plt.show()
     else:
         plt.close()
+    print(f"[INFO] Confusion matrix saved to {cm_path}.")
 
-    return final_model
+    # 4) Evaluate on full training dataframe (accepts 'alpha_str' or 'alpha')
+    full_cm, full_report, full_acc, full_f1 = evaluate_on_full_training(model, df, label_col="alpha_str")
+    full_report_path = os.path.join(folder_path, "full_train_evaluation.txt")
+    with open(full_report_path, "w") as f:
+        f.write("Full-Train Evaluation (ALPHA, default model)\n\n")
+        f.write(full_report)
+        f.write("\n")
+        f.write(f"Accuracy: {full_acc:.4f}\n")
+        f.write(f"Weighted F1: {full_f1:.4f}\n")
+    print(f"[INFO] Full-train evaluation saved to {full_report_path}.")
 
+    plt.figure()
+    sns.heatmap(full_cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=model.classes_, yticklabels=model.classes_)
+    plt.title("Alpha (non-complex) Confusion Matrix (Full-Train)")
+    full_cm_path = os.path.join(folder_path, "confusion_matrix_full_train.png")
+    plt.savefig(full_cm_path)
+    plt.close()
+    print(f"[INFO] Full-train confusion matrix saved to {full_cm_path}.")
+
+    # 5) Save true-training CSV (ensure *_str exists in file)
+    true_csv_path = save_true_training_subset(df, model, label_col="alpha_str", original_csv_path=load_path)
+
+    # 6) Iterate on true-training with a single fraction, repeated N_ITER times
+    #    (load and preprocess: if only alpha_str exists, reconstruct alpha)
+    iter_best_model = iterate_true_training_models(
+        true_csv_path=true_csv_path,
+        label_col="alpha",
+        results_folder=folder_path,
+        random_state=random_state,
+        test_size=test_size,
+        fraction=true_fraction,
+        n_iter=N_ITER
+    )
+
+    if iter_best_model is not None:
+        best_iter_model_path = os.path.join(folder_path, "catboost_alpha_true_train_best.cbm")
+        iter_best_model.save_model(best_iter_model_path)
+        print(f"[INFO] Saved best true-train alpha model to {best_iter_model_path}")
+    else:
+        print("[INFO] Iterative true-train model selection skipped (no valid subset).")
+
+    return model
 
 ##############################################################################
 # 3) Training for Theta (Non-Complex)
@@ -255,11 +486,11 @@ def train_model_for_theta_noncomplex(
         random_state=42,
         model_theta_path="catboost_theta_noncomplex.cbm",
         show_confusion_matrix=False,
-        data_folder="./ML_data/"
+        data_folder="./ML_data/",
+        true_fraction=0.8
 ):
     """
-    Same pipeline for THETA, with text-based confusion matrix & classification report
-    after the baseline, after the Bayesian, and final model.
+    Same pipeline for THETA, using default CatBoost only (no Bayesian optimization).
     """
     # 1) Load data
     load_path = os.path.join(data_folder, train_csv)
@@ -267,166 +498,111 @@ def train_model_for_theta_noncomplex(
     df = load_noncomplex_data(load_path)
     X, y = prepare_features_for_theta_noncomplex(df)
 
-    # 2) Split
+    # 2) Split + default CatBoost
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
     )
     print(f"[INFO] Theta train shape: {X_train.shape}, test shape: {X_test.shape}")
 
-    # 3) Baseline Model
-    baseline_model = CatBoostClassifier(
+    model = CatBoostClassifier(
         task_type="GPU",
         devices="0",
         verbose=0,
         random_seed=random_state
     )
-    print("[INFO] Training baseline CatBoost model (Theta, non-complex)...")
-    baseline_model.fit(X_train, y_train)
+    print("[INFO] Training default CatBoost model (Theta, non-complex)...")
+    model.fit(X_train, y_train)
 
-    y_pred_base = baseline_model.predict(X_test)
-    base_acc = accuracy_score(y_test, y_pred_base)
-    base_f1 = f1_score(y_test, y_pred_base, average="weighted")
-
-    # --- Additional Printouts (Baseline) ---
-    print("\n[BASELINE Model] Classification Report (Theta):")
-    print(classification_report(y_test, y_pred_base, labels=baseline_model.classes_))
-    print("[BASELINE Model] Confusion Matrix (Theta):")
-    print(confusion_matrix(y_test, y_pred_base, labels=baseline_model.classes_))
-
-    print(f"[BASE] Accuracy={base_acc:.4f}, Weighted F1={base_f1:.4f}\n")
-
-    # 4) Bayesian Optimization
-    from skopt import BayesSearchCV
-    from skopt.space import Integer
-
-    bayesian_search_spaces_old = {
-        "depth": Integer(4, 8),
-        "iterations": Integer(500, 3000),
-        "l2_leaf_reg": Integer(1, 10),
-        "border_count": Integer(32, 128)
-    }
-
-    bayesian_search_spaces = {
-        # Centered around CatBoost GPU defaults
-        # depth ~ 6
-        "depth": Integer(5, 7),
-        # iterations ~ 1000
-        "iterations": Integer(900, 1100),
-        # l2_leaf_reg ~ 3
-        "l2_leaf_reg": Integer(2, 5),
-        # GPU default border_count ~ 128 (non-pairwise losses)
-        "border_count": Integer(120, 136)
-    }
-
-    catboost_for_search = CatBoostClassifier(
-        task_type="GPU",
-        devices="0",
-        verbose=0,
-        random_seed=random_state
-    )
-
-    bayes_search = BayesSearchCV(
-        estimator=catboost_for_search,
-        search_spaces=bayesian_search_spaces,
-        n_iter=N_ITER,
-        cv=3,
-        scoring="accuracy",
-        random_state=random_state,
-        verbose=100
-    )
-
-    print("[INFO] Starting Bayesian optimization for CatBoost (Theta, non-complex)...")
-    bayes_search.fit(X_train, y_train)
-    print("[INFO] Bayesian optimization complete.")
-    print("[INFO] Best parameters for Theta:", bayes_search.best_params_)
-
-    model_theta_bayes = bayes_search.best_estimator_
-    y_pred_bayes = model_theta_bayes.predict(X_test)
-    bayes_acc = accuracy_score(y_test, y_pred_bayes)
-    bayes_f1 = f1_score(y_test, y_pred_bayes, average="weighted")
-
-    # --- Additional Printouts (Bayesian) ---
-    print("\n[BAYESIAN Model] Classification Report (Theta):")
-    print(classification_report(y_test, y_pred_bayes, labels=model_theta_bayes.classes_))
-    print("[BAYESIAN Model] Confusion Matrix (Theta):")
-    print(confusion_matrix(y_test, y_pred_bayes, labels=model_theta_bayes.classes_))
-
-    print(f"[BAYES] Accuracy={bayes_acc:.4f}, Weighted F1={bayes_f1:.4f}\n")
-
-    # 5) Compare
-    if bayes_f1 > base_f1:
-        final_model = model_theta_bayes
-        final_model_label = "Bayesian Optimized Model"
-        print("[INFO] => Bayesian model is better for THETA (non-complex).")
-    else:
-        final_model = baseline_model
-        final_model_label = "Baseline (Default) Model"
-        print("[INFO] => Baseline model is better (or equal) for THETA (non-complex).")
-
-    # Evaluate final chosen model
-    y_pred = final_model.predict(X_test)
-    cm = confusion_matrix(y_test, y_pred, labels=final_model.classes_)
-    class_report = classification_report(y_test, y_pred, labels=final_model.classes_)
+    y_pred = model.predict(X_test)
     acc = accuracy_score(y_test, y_pred)
     f1 = f1_score(y_test, y_pred, average="weighted")
 
-    # 6) Save
+    print("\n[DEFAULT Model] Classification Report (Theta):")
+    print(classification_report(y_test, y_pred, labels=model.classes_))
+    print("[DEFAULT Model] Confusion Matrix (Theta):")
+    cm = confusion_matrix(y_test, y_pred, labels=model.classes_)
+    print(cm)
+    print(f"[DEFAULT] Accuracy={acc:.4f}, Weighted F1={f1:.4f}\n")
+
+    # 3) Save default model and artifacts
     csv_base = os.path.splitext(os.path.basename(train_csv))[0]
-    folder_path = os.path.join("noncomplex_results", csv_base)
+    folder_path = os.path.join("noncomplex_results_true", csv_base)
     os.makedirs(folder_path, exist_ok=True)
 
     model_file_path = os.path.join(folder_path, model_theta_path)
-    final_model.save_model(model_file_path)
-    print(f"[INFO] Final theta model (non-complex) saved to {model_file_path}.")
+    model.save_model(model_file_path)
+    print(f"[INFO] Default theta model (non-complex) saved to {model_file_path}.")
 
-    # 7) Write classification report to text
     report_path = os.path.join(folder_path, "classification_report.txt")
+    class_report = classification_report(y_test, y_pred, labels=model.classes_)
     with open(report_path, "w") as f:
-        f.write("Classification Report for THETA (Chosen Final Model, non-complex):\n\n")
-        f.write(f"Chosen Model Type: {final_model_label}\n\n")
+        f.write("Classification Report for THETA (Default CatBoost, non-complex):\n\n")
         f.write(class_report)
         f.write("\n")
         f.write(f"Accuracy: {acc:.4f}\n")
         f.write(f"Weighted F1 Score: {f1:.4f}\n")
-        f.write(f"\n[Baseline => Acc={base_acc:.4f}, F1={base_f1:.4f}]\n")
-        f.write(f"[Bayes   => Acc={bayes_acc:.4f}, F1={bayes_f1:.4f}]\n")
 
     plt.figure()
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
-                xticklabels=final_model.classes_,
-                yticklabels=final_model.classes_)
-    plt.title(f"Theta (non-complex) Confusion Matrix (Final: {final_model_label})")
+                xticklabels=model.classes_, yticklabels=model.classes_)
+    plt.title("Theta (non-complex) Confusion Matrix (Default)")
     cm_path = os.path.join(folder_path, "confusion_matrix.png")
     plt.savefig(cm_path)
-    print(f"[INFO] Confusion matrix saved to {cm_path}.")
     if show_confusion_matrix:
         plt.show()
     else:
         plt.close()
+    print(f"[INFO] Confusion matrix saved to {cm_path}.")
 
-    return final_model
+    # 4) Evaluate on full training dataframe (accepts 'theta_str' or 'theta')
+    full_cm, full_report, full_acc, full_f1 = evaluate_on_full_training(model, df, label_col="theta_str")
+    full_report_path = os.path.join(folder_path, "full_train_evaluation.txt")
+    with open(full_report_path, "w") as f:
+        f.write("Full-Train Evaluation (THETA, default model)\n\n")
+        f.write(full_report)
+        f.write("\n")
+        f.write(f"Accuracy: {full_acc:.4f}\n")
+        f.write(f"Weighted F1: {full_f1:.4f}\n")
+    print(f"[INFO] Full-train evaluation saved to {full_report_path}.")
 
+    plt.figure()
+    sns.heatmap(full_cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=model.classes_, yticklabels=model.classes_)
+    plt.title("Theta (non-complex) Confusion Matrix (Full-Train)")
+    full_cm_path = os.path.join(folder_path, "confusion_matrix_full_train.png")
+    plt.savefig(full_cm_path)
+    plt.close()
+    print(f"[INFO] Full-train confusion matrix saved to {full_cm_path}.")
+
+    # 5) Save true-training CSV (ensure *_str exists in file)
+    true_csv_path = save_true_training_subset(df, model, label_col="theta_str", original_csv_path=load_path)
+
+    # 6) Iterate on true-training with a single fraction, repeated N_ITER times
+    #    (load and preprocess: if only theta_str exists, reconstruct theta)
+    iter_best_model = iterate_true_training_models(
+        true_csv_path=true_csv_path,
+        label_col="theta",
+        results_folder=folder_path,
+        random_state=random_state,
+        test_size=test_size,
+        fraction=true_fraction,
+        n_iter=N_ITER
+    )
+
+    if iter_best_model is not None:
+        best_iter_model_path = os.path.join(folder_path, "catboost_theta_true_train_best.cbm")
+        iter_best_model.save_model(best_iter_model_path)
+        print(f"[INFO] Saved best true-train theta model to {best_iter_model_path}")
+    else:
+        print("[INFO] Iterative true-train model selection skipped (no valid subset).")
+
+    return model
 
 ##############################################################################
 # 4) Example Usage
 ##############################################################################
 
 if __name__ == "__main__":
-    """
-    Suppose you have generated scaled data:
-        ML_ts_data_train_50.csv,
-        ML_ts_data_train_100.csv, ...
-      each containing columns:
-        alpha (or theta),
-        scaled_time_series (list of floats),
-        possibly 'copy' or other metadata.
-
-    We then call 'train_model_for_alpha_noncomplex' or 'train_model_for_theta_noncomplex'
-    on one of these CSVs to produce a CatBoost model that classifies alpha or theta
-    from the scaled time-series snippet, first with a baseline model, then with Bayesian
-    optimization, printing classification reports & confusion matrices for each.
-    """
-
     print("[INFO] training alpha 50!")
     alpha_model_50 = train_model_for_alpha_noncomplex(
         train_csv="ML_ts_data_train_ext_fin_50.csv",
@@ -434,7 +610,8 @@ if __name__ == "__main__":
         random_state=42,
         model_alpha_path="catboost_alpha_ts_ext_fin_50.cbm",
         show_confusion_matrix=False,
-        # data_folder="."
+        # data_folder=".",
+        true_fraction=0.8
     )
 
     print("[INFO] training theta 50!")
@@ -444,7 +621,8 @@ if __name__ == "__main__":
         random_state=42,
         model_theta_path="catboost_theta_ts_ext_fin_50.cbm",
         show_confusion_matrix=False,
-        # data_folder="."
+        # data_folder=".",
+        true_fraction=0.8
     )
 
     print("[INFO] training alpha 100!")
@@ -454,6 +632,7 @@ if __name__ == "__main__":
         random_state=42,
         model_alpha_path="catboost_alpha_ts_ext_fin_100.cbm",
         show_confusion_matrix=False,
+        true_fraction=0.8
     )
 
     print("[INFO] training theta 100!")
@@ -463,25 +642,8 @@ if __name__ == "__main__":
         random_state=42,
         model_theta_path="catboost_theta_ts_ext_fin_100.cbm",
         show_confusion_matrix=False,
+        true_fraction=0.8
     )
-
-    #print("[INFO] training alpha 200!")
-    #alpha_model_200 = train_model_for_alpha_noncomplex(
-    #    train_csv="ML_ts_data_train_ext_fin_200.csv",
-    #    test_size=0.2,
-    #    random_state=42,
-    #    model_alpha_path="catboost_alpha_ts_ext_fin_200.cbm",
-    #    show_confusion_matrix=False,
-    #)
-
-    #print("[INFO] training theta 200!")
-    #theta_model_200 = train_model_for_theta_noncomplex(
-    #    train_csv="ML_ts_data_train_ext_fin_200.csv",
-    #    test_size=0.2,
-    #    random_state=42,
-    #    model_theta_path="catboost_theta_ts_ext_fin_200.cbm",
-    #    show_confusion_matrix=False,
-    #)
 
     print("[INFO] training alpha 250!")
     alpha_model_250 = train_model_for_alpha_noncomplex(
@@ -490,6 +652,7 @@ if __name__ == "__main__":
         random_state=42,
         model_alpha_path="catboost_alpha_ts_ext_fin_250.cbm",
         show_confusion_matrix=False,
+        true_fraction=0.8
     )
 
     print("[INFO] training theta 250!")
@@ -499,6 +662,7 @@ if __name__ == "__main__":
         random_state=42,
         model_theta_path="catboost_theta_ts_ext_fin_250.cbm",
         show_confusion_matrix=False,
+        true_fraction=0.8
     )
 
     print("[INFO] training alpha 365!")
@@ -508,6 +672,7 @@ if __name__ == "__main__":
         random_state=42,
         model_alpha_path="catboost_alpha_ts_ext_fin_365.cbm",
         show_confusion_matrix=False,
+        true_fraction=0.8
     )
 
     print("[INFO] training theta 365!")
@@ -517,6 +682,8 @@ if __name__ == "__main__":
         random_state=42,
         model_theta_path="catboost_theta_ts_ext_fin_365.cbm",
         show_confusion_matrix=False,
+        true_fraction=0.8
     )
 
     print("[INFO] Done training alpha & theta (time series based) models!")
+
