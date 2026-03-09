@@ -7,6 +7,8 @@ Author: Dr. Sebastian Raubitzek
 This repository implements the full experimental pipeline described in the paper  
 **“Mean Reversion and Heavy Tails: Characterizing Time Series Data using Ornstein–Uhlenbeck Processes and Machine Learning”**.
 
+Paper: https://www.mdpi.com/1424-8220/26/4/1263
+
 The code base is organized around three concrete application domains that all reuse the same core methodology:
 
 - **A_** Financial time series (daily asset prices and returns)
